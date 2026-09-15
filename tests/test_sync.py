@@ -260,6 +260,89 @@ class TestDeviceOpener(unittest.TestCase):
         self.assertTrue(ok)
         self.assertGreaterEqual(mock_opener.open.call_count, 1)
 
+    def test_uses_password_mgr_with_default_realm(self):
+        """Opener must use HTTPPasswordMgrWithDefaultRealm so credentials are
+        returned for any realm string the Shelly device includes in its
+        Digest challenge (e.g. 'Shelly', device name, etc.)."""
+        import urllib.request as ur
+        opener = m._device_opener("1.2.3.4", 80, "admin", "secret")
+        digest_handler = next(
+            h for h in opener.handlers if isinstance(h, ur.HTTPDigestAuthHandler)
+        )
+        self.assertIsInstance(digest_handler.passwd,
+                              ur.HTTPPasswordMgrWithDefaultRealm,
+                              "Must use HTTPPasswordMgrWithDefaultRealm, not HTTPPasswordMgr")
+
+    def test_realm_mismatch_still_returns_credentials(self):
+        """Credentials must be returned even when the realm from the server
+        challenge does not match the realm registered (None)."""
+        import urllib.request as ur
+        opener = m._device_opener("1.2.3.4", 80, "admin", "secret")
+        digest_handler = next(
+            h for h in opener.handlers if isinstance(h, ur.HTTPDigestAuthHandler)
+        )
+        mgr = digest_handler.passwd
+        # Shelly devices send realm values like "Shelly" in their 401 challenge;
+        # HTTPPasswordMgr would return (None, None) here — DefaultRealm must not.
+        for realm in ("Shelly", "admin", "ShellyPro4PM", ""):
+            with self.subTest(realm=realm):
+                creds = mgr.find_user_password(realm, "http://1.2.3.4:80/rpc/Shelly.ListMethods")
+                self.assertEqual(creds, ("admin", "secret"),
+                                 f"No credentials returned for realm={realm!r}")
+
+    def test_regression_all_rpc_paths_use_same_opener(self):
+        """Regression: GetDeviceInfo, ListMethods, and PutUserCA must all go
+        through the same authenticated opener — not individual builds per call."""
+        import json as _json
+        import urllib.request as ur
+
+        calls = []
+        # Save the real function before patching
+        real_device_opener = m._device_opener
+
+        def make_opener_with_tracking(host, port, username, password):
+            """Wrap real opener to track every open() call."""
+            real_opener = real_device_opener(host, port, username, password)
+
+            class TrackingOpener:
+                def __init__(self, inner):
+                    self._inner = inner
+                    self.handlers = inner.handlers
+
+                def open(self, req, timeout=None):
+                    calls.append(req.full_url)
+                    resp = MagicMock()
+                    resp.__enter__ = lambda s: s
+                    resp.__exit__ = MagicMock(return_value=False)
+                    resp.status = 200
+                    if "GetDeviceInfo" in req.full_url:
+                        resp.read.return_value = _json.dumps(
+                            {"gen": 2, "fw_id": "1.5.0"}
+                        ).encode()
+                    elif "ListMethods" in req.full_url:
+                        resp.read.return_value = _json.dumps(
+                            {"methods": ["Shelly.PutUserCA",
+                                         "Shelly.PutTLSClientCert",
+                                         "Shelly.PutTLSClientKey"]}
+                        ).encode()
+                    else:
+                        resp.read.return_value = b"{}"
+                    return resp
+
+            return TrackingOpener(real_opener)
+
+        with patch.object(m, "_device_opener", side_effect=make_opener_with_tracking):
+            rc = m.main([
+                "--hosts", "1.2.3.4",
+                "--ca-file", "/dev/null",
+                "--no-enforce-ssl-only",  # skip TLS test so we focus on upload path
+            ])
+
+        # All device calls (GetDeviceInfo, ListMethods, PutUserCA) must appear
+        self.assertTrue(any("GetDeviceInfo" in u for u in calls), f"Missing GetDeviceInfo in {calls}")
+        self.assertTrue(any("ListMethods" in u for u in calls), f"Missing ListMethods in {calls}")
+        self.assertTrue(any("PutUserCA" in u for u in calls), f"Missing PutUserCA in {calls}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -193,11 +193,15 @@ def check_firmware(host: str, port: int, timeout: int,
       2. If ListMethods is unavailable, fall back to firmware version check
          (>= 1.4.2 per Allterco's AWS-IoT provisioning script).
     """
+    auth_active = any(
+        isinstance(h, urllib.request.HTTPDigestAuthHandler) for h in opener.handlers
+    )
     url = f"http://{host}:{port}/rpc/Shelly.GetDeviceInfo"
     req = urllib.request.Request(url, method="GET")
-    log.debug("Firmware check: GET %s", url)
+    log.debug("Firmware check: GET %s  (auth=%s)", url, auth_active)
     try:
         with opener.open(req, timeout=timeout) as resp:
+            log.debug("  → HTTP %s", resp.status)
             info = json.loads(resp.read().decode())
     except Exception as exc:
         return False, f"Could not reach device: {exc}"
@@ -211,8 +215,9 @@ def check_firmware(host: str, port: int, timeout: int,
     try:
         lm_url = f"http://{host}:{port}/rpc/Shelly.ListMethods"
         lm_req = urllib.request.Request(lm_url, method="GET")
-        log.debug("ListMethods: GET %s", lm_url)
+        log.debug("ListMethods: GET %s  (auth=%s)", lm_url, auth_active)
         with opener.open(lm_req, timeout=timeout) as lm_resp:
+            log.debug("  → HTTP %s", lm_resp.status)
             methods_resp = json.loads(lm_resp.read().decode())
         methods = set(methods_resp.get("methods", []))
         required = {"Shelly.PutUserCA", "Shelly.PutTLSClientCert", "Shelly.PutTLSClientKey"}
@@ -248,22 +253,24 @@ def _device_opener(host: str, port: int,
     """
     Build a single urllib opener for all device calls (HTTP and HTTPS).
 
-    Registers credentials for both http:// and https:// base URIs so that
-    Digest auth fires correctly for plain-HTTP RPC calls, the HTTPS TLS test,
-    and any other device endpoint — all using the same nonce state.
+    Uses HTTPPasswordMgrWithDefaultRealm so credentials are returned for any
+    realm value the device sends in its Digest challenge (Shelly devices send
+    a non-empty realm such as "Shelly" or the device name; HTTPPasswordMgr
+    only matches realm=None exactly and silently returns no credentials for
+    any other realm string, which is why ListMethods/Put* return 401 even
+    when GetDeviceInfo succeeds after the first challenge).
 
-    Certificate verification is intentionally disabled for HTTPS because we
-    just pushed a new cert and the device CA is unlikely to be trusted by the
-    calling machine.
+    Registers credentials for both http:// and https:// base URIs so the
+    same opener covers plain-HTTP RPC calls and the HTTPS TLS test.
+    Certificate verification is intentionally disabled for HTTPS.
     """
-    # No-verify SSL context used for the HTTPS TLS test
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
     if device_username and device_password:
-        mgr = urllib.request.HTTPPasswordMgr()
-        # Register for both http and https so auth works regardless of scheme
+        # DefaultRealm: fall back to the None entry for any unmatched realm string
+        mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
         for uri in (f"http://{host}:{port}/", f"https://{host}/"):
             mgr.add_password(None, uri, device_username, device_password)
         return urllib.request.build_opener(
@@ -288,8 +295,12 @@ def _rpc_call(host: str, port: int, method: str, params: dict, timeout: int,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    log.debug("RPC POST %s", url)
+    auth_active = any(
+        isinstance(h, urllib.request.HTTPDigestAuthHandler) for h in opener.handlers
+    )
+    log.debug("RPC POST %s  (auth=%s)", url, auth_active)
     with opener.open(req, timeout=timeout) as resp:
+        log.debug("  → HTTP %s", resp.status)
         return json.loads(resp.read().decode())
 
 
@@ -343,11 +354,15 @@ def _test_tls(host: str, timeout: int,
     the no-verify SSL context and any Digest auth configured). Returns (ok, reason).
     """
     url = f"https://{host}/rpc/Shelly.GetDeviceInfo"
-    log.debug("TLS test: GET %s (cert verification disabled)", url)
+    auth_active = any(
+        isinstance(h, urllib.request.HTTPDigestAuthHandler) for h in opener.handlers
+    )
+    log.debug("TLS test: GET %s  (cert_verify=off, auth=%s)", url, auth_active)
     try:
         req = urllib.request.Request(url, method="GET")
         with opener.open(req, timeout=timeout) as resp:
             status = resp.status
+        log.debug("  → HTTP %s", status)
         if status == 200:
             return True, "HTTP 200"
         return False, f"HTTP {status}"
