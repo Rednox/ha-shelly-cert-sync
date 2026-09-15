@@ -3,16 +3,198 @@
 sync_shelly_certs.py – Upload Let's Encrypt (or any PEM) certificates to
 Shelly Gen-2+ devices via the HTTP RPC interface, then optionally enforce
 SSL-only mode after a successful TLS connectivity test.
+
+Device hosts can be supplied explicitly via --hosts or discovered
+automatically from a running Home Assistant instance via --ha-url /
+--ha-token (Shelly integration devices only).
 """
 
 import argparse
 import base64
 import json
+import re
 import ssl
 import sys
-import urllib.error
 import urllib.request
 from typing import Optional
+
+
+# Minimum firmware version that supports the TLS certificate RPC methods.
+# Allterco's own AWS-IoT provisioning tooling enforces >= 1.4.2 before
+# calling PutUserCA / PutTLSClientCert / PutTLSClientKey, and treats
+# firmware below 1.3.0 as "too old to update automatically".
+# Gen-1 devices use a completely different REST API and are not supported.
+MIN_FW_VERSION = (1, 4, 2)
+
+
+# ---------------------------------------------------------------------------
+# Home Assistant discovery
+# ---------------------------------------------------------------------------
+
+def _ha_request(ha_url: str, token: str, path: str, timeout: int,
+                payload: Optional[dict] = None) -> object:
+    """Perform a GET (or POST when payload is given) against the HA REST API."""
+    url = ha_url.rstrip("/") + path
+    method = "POST" if payload is not None else "GET"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+        },
+        method=method,
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def discover_shelly_hosts(ha_url: str, token: str, timeout: int) -> list[str]:
+    """
+    Query the Home Assistant REST API to find all Shelly devices and return
+    their IP addresses / hostnames.
+
+    Strategy (pure REST, no WebSocket required):
+      1. POST /api/template with integration_entities("shelly") to get all
+         entity_ids belonging to the Shelly integration.
+      2. For each unique device (deduplicated via device_id(entity_id)),
+         resolve its configuration_url via device_attr(..., "configuration_url").
+         The Shelly coordinator stores this as "http://<host>:<port>".
+    """
+    print("Discovering Shelly devices from Home Assistant …")
+
+    # Step 1: collect all entity_ids from the shelly integration
+    try:
+        raw = _ha_request(
+            ha_url, token, "/api/template", timeout,
+            payload={"template": "{{ integration_entities('shelly') | list | tojson }}"},
+        )
+        # The template API returns a plain string (the rendered template)
+        entity_ids: list[str] = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        print(f"  ERROR fetching Shelly entity list from HA: {exc}")
+        return []
+
+    if not entity_ids:
+        print("  No Shelly entities found in Home Assistant.")
+        return []
+
+    # Step 2: resolve configuration_url for each unique device.
+    # Validate entity_id format before embedding in Jinja2 template to
+    # prevent template injection from a malformed or malicious entity_id.
+    _SAFE_ENTITY_ID = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+    urls: set[str] = set()
+    for entity_id in entity_ids:
+        if not _SAFE_ENTITY_ID.match(entity_id):
+            print(f"  WARNING: skipping entity_id with unexpected characters: {entity_id!r}")
+            continue
+        try:
+            tmpl = (
+                f"{{% set dev_id = device_id('{entity_id}') %}}"
+                "{% if dev_id %}"
+                "{{ device_attr(dev_id, 'configuration_url') }}"
+                "{% endif %}"
+            )
+            raw_url = _ha_request(
+                ha_url, token, "/api/template", timeout,
+                payload={"template": tmpl},
+            )
+            config_url = str(raw_url).strip() if isinstance(raw_url, str) else ""
+            if config_url and config_url not in ("None", "null", ""):
+                urls.add(config_url)
+        except Exception:
+            pass  # skip entities we can't resolve
+
+    # Extract host from "http://<host>:<port>" or "https://<host>:<port>"
+    hosts: list[str] = []
+    for url in sorted(urls):
+        if "://" in url:
+            host_port = url.split("://", 1)[1].rstrip("/")
+            # Strip port, keep only host
+            host = host_port.split(":")[0]
+            if host:
+                hosts.append(host)
+
+    if hosts:
+        print(f"  Found {len(hosts)} Shelly device(s): {', '.join(hosts)}")
+    else:
+        print("  No Shelly devices with a configuration_url found.")
+
+    return hosts
+
+
+# ---------------------------------------------------------------------------
+# Firmware version check
+# ---------------------------------------------------------------------------
+
+def _parse_fw_version(ver_str: str) -> tuple[int, ...]:
+    """
+    Parse a Shelly firmware version string such as '1.4.2-g6d2a586' or
+    '20231219-133223/1.1.0@6b5e5587' into a comparable integer tuple.
+    """
+    # Extract the first dotted-decimal portion
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", ver_str)
+    if m:
+        return tuple(int(x) for x in m.groups())
+    # Fallback: try just major.minor
+    m = re.search(r"(\d+)\.(\d+)", ver_str)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), 0)
+    return (0, 0, 0)
+
+
+def check_firmware(host: str, port: int, timeout: int) -> tuple[bool, str]:
+    """
+    Verify the device is Gen-2+ and capable of TLS certificate uploads.
+
+    Two-step approach recommended by Allterco's own fleet management tooling:
+      1. Call Shelly.ListMethods and confirm all three Put* methods are present
+         (runtime capability detection — more reliable than version comparison).
+      2. If ListMethods is unavailable, fall back to firmware version check
+         (>= 1.4.2 per Allterco's AWS-IoT provisioning script).
+
+    Gen-1 devices do not implement Shelly.GetDeviceInfo on /rpc and will
+    fail the initial request, which we treat as "not supported".
+    """
+    url = f"http://{host}:{port}/rpc/Shelly.GetDeviceInfo"
+    # GET with no body is the standard lightweight call for this endpoint
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            info = json.loads(resp.read().decode())
+    except Exception as exc:
+        return False, f"Could not reach device: {exc}"
+
+    # "gen" field: 1 = Gen-1, 2 = Gen-2, 3 = Gen-3
+    gen = info.get("gen", 1)
+    if gen < 2:
+        return False, f"Gen-{gen} device – RPC TLS methods not supported"
+
+    # Preferred: runtime capability check via Shelly.ListMethods
+    try:
+        lm_url = f"http://{host}:{port}/rpc/Shelly.ListMethods"
+        lm_req = urllib.request.Request(lm_url, method="GET")
+        with urllib.request.urlopen(lm_req, timeout=timeout) as lm_resp:
+            methods_resp = json.loads(lm_resp.read().decode())
+        methods = set(methods_resp.get("methods", []))
+        required = {"Shelly.PutUserCA", "Shelly.PutTLSClientCert", "Shelly.PutTLSClientKey"}
+        missing = required - methods
+        if missing:
+            return False, f"Device does not advertise required methods: {', '.join(sorted(missing))}"
+        fw_str = info.get("fw_id") or info.get("ver") or "unknown"
+        return True, f"Gen-{gen}, firmware {fw_str} (ListMethods OK)"
+    except Exception:
+        pass  # ListMethods unavailable; fall back to version check
+
+    # Fallback: firmware version comparison
+    fw_str = info.get("fw_id") or info.get("ver") or ""
+    fw_tuple = _parse_fw_version(fw_str)
+    if fw_tuple < MIN_FW_VERSION:
+        min_str = ".".join(str(x) for x in MIN_FW_VERSION)
+        return False, f"Firmware {fw_str} is below minimum {min_str}"
+
+    return True, f"Gen-{gen}, firmware {fw_str}"
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +282,7 @@ def _test_tls(host: str, timeout: int) -> tuple[bool, str]:
 
 def _enforce_ssl_only(host: str, port: int, timeout: int, dry_run: bool) -> bool:
     """
-    Enable SSL-only mode via Shelly.SetConfig (https_ca_required = true).
+    Enable SSL-only mode via Shelly.SetConfig (ssl_ca = "*").
     Returns True on success.
     """
     params = {
@@ -134,6 +316,17 @@ def process_host(host: str, args: argparse.Namespace,
                  key_text: Optional[str]) -> bool:
     """Process one host; return True if every step succeeded."""
     print(f"\n=== Host: {host} ===")
+
+    # --- firmware / generation check ---
+    if args.dry_run:
+        print("    [dry-run] firmware check skipped")
+    else:
+        supported, fw_reason = check_firmware(host, args.port, args.timeout)
+        if not supported:
+            print(f"    SKIP: {fw_reason}")
+            return False
+        print(f"    Firmware OK: {fw_reason}")
+
     host_ok = True
 
     # --- uploads ---
@@ -184,12 +377,33 @@ def process_host(host: str, args: argparse.Namespace,
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Upload Let's Encrypt certs to Shelly devices via HTTP RPC."
+        description=(
+            "Upload Let's Encrypt certs to Shelly devices via HTTP RPC. "
+            "Hosts can be supplied explicitly (--hosts) or discovered "
+            "automatically from Home Assistant (--ha-url + --ha-token)."
+        )
     )
-    parser.add_argument(
-        "--hosts", required=True,
+
+    # Host selection (one of the two groups is required; validated in main)
+    host_group = parser.add_argument_group("host selection (use one)")
+    host_group.add_argument(
+        "--hosts",
+        default=None,
         help="Comma-separated list of Shelly IPs/hostnames.",
     )
+    host_group.add_argument(
+        "--ha-url",
+        default=None,
+        metavar="URL",
+        help="Home Assistant base URL, e.g. http://homeassistant.local:8123",
+    )
+    host_group.add_argument(
+        "--ha-token",
+        default=None,
+        metavar="TOKEN",
+        help="Home Assistant long-lived access token (used with --ha-url).",
+    )
+
     parser.add_argument("--ca-file", default=None, help="Path to CA PEM file.")
     parser.add_argument("--cert-file", default=None, help="Path to TLS client cert PEM.")
     parser.add_argument("--key-file", default=None, help="Path to TLS client key PEM.")
@@ -212,7 +426,26 @@ def main() -> int:
         print("ERROR: at least one of --ca-file, --cert-file, --key-file is required.")
         return 1
 
-    # Read files once
+    # Resolve host list
+    if args.hosts and args.ha_url:
+        print("ERROR: use either --hosts or --ha-url, not both.")
+        return 1
+
+    if args.ha_url:
+        if not args.ha_token:
+            print("ERROR: --ha-token is required when using --ha-url.")
+            return 1
+        hosts = discover_shelly_hosts(args.ha_url, args.ha_token, args.timeout)
+        if not hosts:
+            print("No Shelly hosts discovered; nothing to do.")
+            return 1
+    elif args.hosts:
+        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+    else:
+        print("ERROR: provide --hosts or --ha-url to specify target device(s).")
+        return 1
+
+    # Read PEM files once
     def read_pem(path: Optional[str]) -> Optional[str]:
         if path is None:
             return None
@@ -227,7 +460,6 @@ def main() -> int:
         print(f"ERROR reading file: {exc}")
         return 1
 
-    hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
     results = {}
     for host in hosts:
         results[host] = process_host(host, args, ca_text, cert_text, key_text)
@@ -246,3 +478,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
