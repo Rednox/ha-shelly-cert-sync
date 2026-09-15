@@ -13,13 +13,15 @@ the SUPERVISOR_TOKEN environment variable and the internal API is reachable
 at http://supervisor/core — both --ha-url and --ha-token can be omitted in
 that case and are detected automatically.
 
-If the Shelly devices have a password set, supply it via --device-password.
-The same password is used for all devices (HTTP Digest auth, user "admin").
+If the Shelly devices are password-protected, supply credentials via
+--device-username (default: admin) and --device-password.
+Both flags must be provided together; the same credentials apply to all hosts.
 """
 
 import argparse
 import base64
 import json
+import logging
 import os
 import re
 import ssl
@@ -27,6 +29,10 @@ import sys
 import urllib.request
 from typing import Optional
 
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 # Minimum firmware version that supports the TLS certificate RPC methods.
 # Allterco's own AWS-IoT provisioning tooling enforces >= 1.4.2 before
@@ -39,8 +45,25 @@ MIN_FW_VERSION = (1, 4, 2)
 _SUPERVISOR_TOKEN_ENV = "SUPERVISOR_TOKEN"
 _SUPERVISOR_API_URL = "http://supervisor/core"
 
-# Fixed username used by Shelly Gen-2/Gen-3 devices
-_DEVICE_USERNAME = "admin"
+# Default device username for Shelly Gen-2/Gen-3
+_DEFAULT_DEVICE_USERNAME = "admin"
+
+log = logging.getLogger("shelly_cert_sync")
+
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+def setup_logging(debug: bool, log_file: Optional[str]) -> None:
+    """Configure the root logger based on CLI flags."""
+    level = logging.DEBUG if debug else logging.INFO
+    fmt = "%(asctime)s %(levelname)-8s %(message)s"
+    datefmt = "%Y-%m-%dT%H:%M:%S"
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +85,7 @@ def _ha_request(ha_url: str, token: str, path: str, timeout: int,
         },
         method=method,
     )
+    log.debug("HA API %s %s", method, url)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
@@ -78,7 +102,7 @@ def discover_shelly_hosts(ha_url: str, token: str, timeout: int) -> list[str]:
          resolve its configuration_url via device_attr(..., "configuration_url").
          The Shelly coordinator stores this as "http://<host>:<port>".
     """
-    print("Discovering Shelly devices from Home Assistant …")
+    log.info("Discovering Shelly devices from Home Assistant …")
 
     # Step 1: collect all entity_ids from the shelly integration
     try:
@@ -86,15 +110,16 @@ def discover_shelly_hosts(ha_url: str, token: str, timeout: int) -> list[str]:
             ha_url, token, "/api/template", timeout,
             payload={"template": "{{ integration_entities('shelly') | list | tojson }}"},
         )
-        # The template API returns a plain string (the rendered template)
         entity_ids: list[str] = json.loads(raw) if isinstance(raw, str) else raw
     except Exception as exc:
-        print(f"  ERROR fetching Shelly entity list from HA: {exc}")
+        log.error("Could not fetch Shelly entity list from HA: %s", exc)
         return []
 
     if not entity_ids:
-        print("  No Shelly entities found in Home Assistant.")
+        log.warning("No Shelly entities found in Home Assistant.")
         return []
+
+    log.debug("Found %d Shelly entity_id(s) in HA", len(entity_ids))
 
     # Step 2: resolve configuration_url for each unique device.
     # Validate entity_id format before embedding in Jinja2 template to
@@ -103,7 +128,7 @@ def discover_shelly_hosts(ha_url: str, token: str, timeout: int) -> list[str]:
     urls: set[str] = set()
     for entity_id in entity_ids:
         if not _SAFE_ENTITY_ID.match(entity_id):
-            print(f"  WARNING: skipping entity_id with unexpected characters: {entity_id!r}")
+            log.warning("Skipping entity_id with unexpected characters: %r", entity_id)
             continue
         try:
             tmpl = (
@@ -118,24 +143,24 @@ def discover_shelly_hosts(ha_url: str, token: str, timeout: int) -> list[str]:
             )
             config_url = str(raw_url).strip() if isinstance(raw_url, str) else ""
             if config_url and config_url not in ("None", "null", ""):
+                log.debug("entity %s → configuration_url %s", entity_id, config_url)
                 urls.add(config_url)
-        except Exception:
-            pass  # skip entities we can't resolve
+        except Exception as exc:
+            log.debug("Could not resolve configuration_url for %s: %s", entity_id, exc)
 
     # Extract host from "http://<host>:<port>" or "https://<host>:<port>"
     hosts: list[str] = []
     for url in sorted(urls):
         if "://" in url:
             host_port = url.split("://", 1)[1].rstrip("/")
-            # Strip port, keep only host
             host = host_port.split(":")[0]
             if host:
                 hosts.append(host)
 
     if hosts:
-        print(f"  Found {len(hosts)} Shelly device(s): {', '.join(hosts)}")
+        log.info("Found %d Shelly device(s): %s", len(hosts), ", ".join(hosts))
     else:
-        print("  No Shelly devices with a configuration_url found.")
+        log.warning("No Shelly devices with a configuration_url found.")
 
     return hosts
 
@@ -149,11 +174,9 @@ def _parse_fw_version(ver_str: str) -> tuple[int, ...]:
     Parse a Shelly firmware version string such as '1.4.2-g6d2a586' or
     '20231219-133223/1.1.0@6b5e5587' into a comparable integer tuple.
     """
-    # Extract the first dotted-decimal portion
     m = re.search(r"(\d+)\.(\d+)\.(\d+)", ver_str)
     if m:
         return tuple(int(x) for x in m.groups())
-    # Fallback: try just major.minor
     m = re.search(r"(\d+)\.(\d+)", ver_str)
     if m:
         return (int(m.group(1)), int(m.group(2)), 0)
@@ -161,30 +184,28 @@ def _parse_fw_version(ver_str: str) -> tuple[int, ...]:
 
 
 def check_firmware(host: str, port: int, timeout: int,
+                   device_username: Optional[str] = None,
                    device_password: Optional[str] = None) -> tuple[bool, str]:
     """
     Verify the device is Gen-2+ and capable of TLS certificate uploads.
 
     Two-step approach recommended by Allterco's own fleet management tooling:
-      1. Call Shelly.ListMethods and confirm all three Put* methods are present
-         (runtime capability detection — more reliable than version comparison).
+      1. Call Shelly.ListMethods and confirm all three Put* methods are present.
       2. If ListMethods is unavailable, fall back to firmware version check
          (>= 1.4.2 per Allterco's AWS-IoT provisioning script).
-
-    Gen-1 devices do not implement Shelly.GetDeviceInfo on /rpc and will
-    fail the initial request, which we treat as "not supported".
     """
-    opener = _device_opener(host, port, device_password)
+    opener = _device_opener(host, port, device_username, device_password)
     url = f"http://{host}:{port}/rpc/Shelly.GetDeviceInfo"
     req = urllib.request.Request(url, method="GET")
+    log.debug("Firmware check: GET %s", url)
     try:
         with opener.open(req, timeout=timeout) as resp:
             info = json.loads(resp.read().decode())
     except Exception as exc:
         return False, f"Could not reach device: {exc}"
 
-    # "gen" field: 1 = Gen-1, 2 = Gen-2, 3 = Gen-3
     gen = info.get("gen", 1)
+    log.debug("Device gen=%s fw_id=%s", gen, info.get("fw_id") or info.get("ver"))
     if gen < 2:
         return False, f"Gen-{gen} device – RPC TLS methods not supported"
 
@@ -192,17 +213,22 @@ def check_firmware(host: str, port: int, timeout: int,
     try:
         lm_url = f"http://{host}:{port}/rpc/Shelly.ListMethods"
         lm_req = urllib.request.Request(lm_url, method="GET")
+        log.debug("ListMethods: GET %s", lm_url)
         with opener.open(lm_req, timeout=timeout) as lm_resp:
             methods_resp = json.loads(lm_resp.read().decode())
         methods = set(methods_resp.get("methods", []))
         required = {"Shelly.PutUserCA", "Shelly.PutTLSClientCert", "Shelly.PutTLSClientKey"}
         missing = required - methods
         if missing:
-            return False, f"Device does not advertise required methods: {', '.join(sorted(missing))}"
+            return False, (
+                f"Device does not advertise required methods: "
+                f"{', '.join(sorted(missing))}"
+            )
         fw_str = info.get("fw_id") or info.get("ver") or "unknown"
+        log.debug("ListMethods OK; required methods present")
         return True, f"Gen-{gen}, firmware {fw_str} (ListMethods OK)"
-    except Exception:
-        pass  # ListMethods unavailable; fall back to version check
+    except Exception as exc:
+        log.debug("ListMethods unavailable (%s); falling back to version check", exc)
 
     # Fallback: firmware version comparison
     fw_str = info.get("fw_id") or info.get("ver") or ""
@@ -219,18 +245,19 @@ def check_firmware(host: str, port: int, timeout: int,
 # ---------------------------------------------------------------------------
 
 def _device_opener(host: str, port: int,
+                   device_username: Optional[str],
                    device_password: Optional[str]) -> urllib.request.OpenerDirector:
     """
     Build an urllib opener for a Shelly device.
-    When device_password is set, attaches an HTTPDigestAuthHandler so that
-    401 challenges are answered automatically with user "admin" + password.
+    When credentials are set, attaches an HTTPDigestAuthHandler so that
+    401 challenges are answered automatically.
     """
-    if device_password:
+    if device_username and device_password:
         mgr = urllib.request.HTTPPasswordMgr()
         mgr.add_password(
             realm=None,
             uri=f"http://{host}:{port}/",
-            user=_DEVICE_USERNAME,
+            user=device_username,
             passwd=device_password,
         )
         return urllib.request.build_opener(urllib.request.HTTPDigestAuthHandler(mgr))
@@ -241,8 +268,9 @@ def _device_opener(host: str, port: int,
 # RPC helpers
 # ---------------------------------------------------------------------------
 
-def _rpc_call(host: str, port: int, method: str, params: dict,
-              timeout: int, device_password: Optional[str] = None) -> dict:
+def _rpc_call(host: str, port: int, method: str, params: dict, timeout: int,
+              device_username: Optional[str] = None,
+              device_password: Optional[str] = None) -> dict:
     """Send a single HTTP RPC call and return the parsed JSON response."""
     url = f"http://{host}:{port}/rpc/Shelly.{method}"
     body = json.dumps(params).encode()
@@ -252,46 +280,50 @@ def _rpc_call(host: str, port: int, method: str, params: dict,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    opener = _device_opener(host, port, device_password)
+    log.debug("RPC POST %s", url)
+    opener = _device_opener(host, port, device_username, device_password)
     with opener.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
 def _upload_file(host: str, port: int, method: str, pem_text: str,
                  chunk_size: int, timeout: int, dry_run: bool,
+                 device_username: Optional[str] = None,
                  device_password: Optional[str] = None) -> bool:
     """
     Upload a PEM file to a Shelly device using the given RPC method name.
     Returns True on success, False on any error.
     """
-    # Step 1: clear existing data
-    if dry_run:
-        print(f"    [dry-run] {method}: clear (data=null)")
-    else:
-        try:
-            _rpc_call(host, port, method, {"data": None}, timeout, device_password)
-        except Exception as exc:
-            print(f"    ERROR clearing {method}: {exc}")
-            return False
-
-    # Step 2: upload chunks as base64
     encoded = base64.b64encode(pem_text.encode()).decode()
     chunks = [encoded[i:i + chunk_size]
               for i in range(0, len(encoded), chunk_size)]
+    log.debug("%s: %d byte(s) → %d chunk(s) of ≤%d", method, len(encoded), len(chunks), chunk_size)
 
+    # Step 1: clear existing data
+    if dry_run:
+        log.info("  [dry-run] %s: clear (data=null)", method)
+    else:
+        try:
+            _rpc_call(host, port, method, {"data": None}, timeout, device_username, device_password)
+        except Exception as exc:
+            log.error("  %s: clear failed: %s", method, exc)
+            return False
+
+    # Step 2: upload chunks
     for idx, chunk in enumerate(chunks):
         if dry_run:
-            print(f"    [dry-run] {method}: chunk {idx + 1}/{len(chunks)}")
+            log.info("  [dry-run] %s: chunk %d/%d", method, idx + 1, len(chunks))
             continue
+        log.debug("  %s: uploading chunk %d/%d", method, idx + 1, len(chunks))
         try:
             _rpc_call(host, port, method, {"data": chunk, "append": True}, timeout,
-                      device_password)
+                      device_username, device_password)
         except Exception as exc:
-            print(f"    ERROR uploading chunk {idx + 1} via {method}: {exc}")
+            log.error("  %s: chunk %d/%d failed: %s", method, idx + 1, len(chunks), exc)
             return False
 
     if not dry_run:
-        print(f"    {method}: OK ({len(chunks)} chunk(s))")
+        log.info("  %s: OK (%d chunk(s))", method, len(chunks))
     return True
 
 
@@ -300,22 +332,23 @@ def _upload_file(host: str, port: int, method: str, pem_text: str,
 # ---------------------------------------------------------------------------
 
 def _test_tls(host: str, timeout: int,
+              device_username: Optional[str] = None,
               device_password: Optional[str] = None) -> tuple[bool, str]:
     """
     Try an HTTPS GET to the device. Returns (success, reason).
     Certificate verification is intentionally disabled because we just pushed
     a new cert and the device CA trust may not match the calling machine.
-    When a device password is set, Digest auth is applied over HTTPS as well.
     """
     url = f"https://{host}/rpc/Shelly.GetDeviceInfo"
+    log.debug("TLS test: GET %s (cert verification disabled)", url)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     try:
         req = urllib.request.Request(url, method="GET")
-        if device_password:
+        if device_username and device_password:
             mgr = urllib.request.HTTPPasswordMgr()
-            mgr.add_password(None, f"https://{host}/", _DEVICE_USERNAME, device_password)
+            mgr.add_password(None, f"https://{host}/", device_username, device_password)
             opener = urllib.request.build_opener(
                 urllib.request.HTTPSHandler(context=ctx),
                 urllib.request.HTTPDigestAuthHandler(mgr),
@@ -329,6 +362,7 @@ def _test_tls(host: str, timeout: int,
             return True, "HTTP 200"
         return False, f"HTTP {status}"
     except Exception as exc:
+        log.debug("TLS test exception: %s", exc)
         return False, str(exc)
 
 
@@ -337,29 +371,23 @@ def _test_tls(host: str, timeout: int,
 # ---------------------------------------------------------------------------
 
 def _enforce_ssl_only(host: str, port: int, timeout: int, dry_run: bool,
+                      device_username: Optional[str] = None,
                       device_password: Optional[str] = None) -> bool:
     """
     Enable SSL-only mode via Shelly.SetConfig (ssl_ca = "*").
     Returns True on success.
     """
-    params = {
-        "config": {
-            "sys": {
-                "device": {
-                    "ssl_ca": "*"  # '*' = use uploaded CA; enforces HTTPS-only
-                }
-            }
-        }
-    }
+    params = {"config": {"sys": {"device": {"ssl_ca": "*"}}}}
     if dry_run:
-        print("    [dry-run] Shelly.SetConfig: ssl_ca=* (SSL-only)")
+        log.info("  [dry-run] Shelly.SetConfig: ssl_ca=* (SSL-only)")
         return True
+    log.debug("Enforcing SSL-only on %s", host)
     try:
-        _rpc_call(host, port, "SetConfig", params, timeout, device_password)
-        print("    Shelly.SetConfig: SSL-only enforced")
+        _rpc_call(host, port, "SetConfig", params, timeout, device_username, device_password)
+        log.info("  Shelly.SetConfig: SSL-only enforced")
         return True
     except Exception as exc:
-        print(f"    ERROR enforcing SSL-only via Shelly.SetConfig: {exc}")
+        log.error("  Shelly.SetConfig failed: %s", exc)
         return False
 
 
@@ -372,18 +400,21 @@ def process_host(host: str, args: argparse.Namespace,
                  cert_text: Optional[str],
                  key_text: Optional[str]) -> bool:
     """Process one host; return True if every step succeeded."""
-    print(f"\n=== Host: {host} ===")
-    pwd = args.device_password  # None if not set
+    log.info("")
+    log.info("=== Host: %s ===", host)
+    uname = args.device_username
+    pwd = args.device_password
 
     # --- firmware / generation check ---
     if args.dry_run:
-        print("    [dry-run] firmware check skipped")
+        log.info("  [dry-run] firmware check skipped")
     else:
-        supported, fw_reason = check_firmware(host, args.port, args.timeout, pwd)
+        log.debug("Running firmware/capability check …")
+        supported, fw_reason = check_firmware(host, args.port, args.timeout, uname, pwd)
         if not supported:
-            print(f"    SKIP: {fw_reason}")
+            log.warning("  SKIP: %s", fw_reason)
             return False
-        print(f"    Firmware OK: {fw_reason}")
+        log.info("  Firmware OK: %s", fw_reason)
 
     host_ok = True
 
@@ -399,30 +430,30 @@ def process_host(host: str, args: argparse.Namespace,
     for method, pem_text in uploads:
         ok = _upload_file(
             host, args.port, method, pem_text,
-            args.chunk_size, args.timeout, args.dry_run, pwd,
+            args.chunk_size, args.timeout, args.dry_run, uname, pwd,
         )
         if not ok:
             host_ok = False
 
     # --- TLS test ---
     if args.dry_run:
-        print("    [dry-run] TLS test skipped")
-        tls_ok = False  # don't proceed to SSL-only in dry-run
+        log.info("  [dry-run] TLS test skipped")
+        tls_ok = False
     else:
-        tls_ok, reason = _test_tls(host, args.timeout, pwd)
+        tls_ok, reason = _test_tls(host, args.timeout, uname, pwd)
         if tls_ok:
-            print(f"    TLS test: PASS ({reason})")
+            log.info("  TLS test: PASS (%s)", reason)
         else:
-            print(f"    TLS test: FAIL ({reason})")
+            log.warning("  TLS test: FAIL (%s)", reason)
             host_ok = False
 
     # --- SSL-only enforcement ---
     if args.no_enforce_ssl_only:
-        print("    SSL-only: skipped (--no-enforce-ssl-only)")
+        log.info("  SSL-only: skipped (--no-enforce-ssl-only)")
     elif not tls_ok:
-        print("    SSL-only: skipped (TLS test did not pass)")
+        log.info("  SSL-only: skipped (TLS test did not pass)")
     else:
-        ssl_ok = _enforce_ssl_only(host, args.port, args.timeout, args.dry_run, pwd)
+        ssl_ok = _enforce_ssl_only(host, args.port, args.timeout, args.dry_run, uname, pwd)
         if not ssl_ok:
             host_ok = False
 
@@ -433,7 +464,7 @@ def process_host(host: str, args: argparse.Namespace,
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Upload Let's Encrypt certs to Shelly devices via HTTP RPC. "
@@ -444,7 +475,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
 
-    # Host selection (one of the two groups is required; validated in main)
+    # Host selection
     host_group = parser.add_argument_group("host selection (use one)")
     host_group.add_argument(
         "--hosts",
@@ -470,18 +501,34 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    # PEM files
     parser.add_argument("--ca-file", default=None, help="Path to CA PEM file.")
     parser.add_argument("--cert-file", default=None, help="Path to TLS client cert PEM.")
     parser.add_argument("--key-file", default=None, help="Path to TLS client key PEM.")
-    parser.add_argument(
+
+    # Device auth
+    auth_group = parser.add_argument_group("device authentication")
+    auth_group.add_argument(
+        "--device-username",
+        default=None,
+        metavar="USER",
+        help=(
+            f"Device username for HTTP Digest auth (default: {_DEFAULT_DEVICE_USERNAME}). "
+            "Must be used together with --device-password."
+        ),
+    )
+    auth_group.add_argument(
         "--device-password",
         default=None,
         metavar="PASSWORD",
         help=(
-            "Device password (HTTP Digest auth, user 'admin'). "
-            "Applied to all hosts. Omit if devices have no password set."
+            "Device password for HTTP Digest auth. "
+            "Applied to all hosts. Must be used together with --device-username "
+            f"(or alone, in which case username defaults to {_DEFAULT_DEVICE_USERNAME!r})."
         ),
     )
+
+    # Behaviour
     parser.add_argument("--port", type=int, default=80, help="HTTP port (default 80).")
     parser.add_argument("--timeout", type=int, default=10, help="Request timeout in seconds.")
     parser.add_argument("--chunk-size", type=int, default=1024,
@@ -490,59 +537,102 @@ def parse_args() -> argparse.Namespace:
                         help="Print actions without sending mutating requests.")
     parser.add_argument("--no-enforce-ssl-only", action="store_true",
                         help="Skip SSL-only switch even if TLS test passes.")
-    return parser.parse_args()
+
+    # Logging
+    log_group = parser.add_argument_group("logging")
+    log_group.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose debug logging.",
+    )
+    log_group.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Append log output to this file in addition to stdout.",
+    )
+
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
+
+    # Set up logging first so all subsequent messages are formatted
+    setup_logging(args.debug, args.log_file)
+
+    # Validate auth args: if either is given, apply default username and require password
+    if args.device_password and not args.device_username:
+        args.device_username = _DEFAULT_DEVICE_USERNAME
+        log.debug("--device-username defaulted to %r", args.device_username)
+    if args.device_username and not args.device_password:
+        log.error(
+            "--device-username was set but --device-password is missing. "
+            "Provide both flags or neither."
+        )
+        return 2
 
     # Validate: at least one file must be provided
     if not any([args.ca_file, args.cert_file, args.key_file]):
-        print("ERROR: at least one of --ca-file, --cert-file, --key-file is required.")
-        return 1
+        log.error(
+            "At least one of --ca-file, --cert-file, --key-file is required."
+        )
+        return 2
+
+    # Validate mutual exclusion of host-selection modes
+    if args.hosts and args.ha_url:
+        log.error("Use either --hosts or --ha-url, not both.")
+        return 2
 
     # Resolve host list
-    if args.hosts and args.ha_url:
-        print("ERROR: use either --hosts or --ha-url, not both.")
-        return 1
-
     if args.hosts:
         hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+        log.debug("Explicit hosts: %s", hosts)
     else:
-        # Auto-detect HA Supervisor environment when neither --ha-url nor
-        # --ha-token was passed (e.g. when invoked as an HA shell_command).
         supervisor_token = os.environ.get(_SUPERVISOR_TOKEN_ENV, "")
         ha_url = args.ha_url or (_SUPERVISOR_API_URL if supervisor_token else None)
         ha_token = args.ha_token or supervisor_token or None
 
         if not ha_url:
-            print(
-                "ERROR: provide --hosts or --ha-url to specify target device(s), "
-                f"or run inside Home Assistant where ${_SUPERVISOR_TOKEN_ENV} is set."
+            log.error(
+                "Provide --hosts or --ha-url to specify target device(s), "
+                "or run inside Home Assistant where $%s is set.",
+                _SUPERVISOR_TOKEN_ENV,
             )
-            return 1
+            return 2
         if not ha_token:
-            print("ERROR: --ha-token is required when using --ha-url.")
-            return 1
+            log.error("--ha-token is required when using --ha-url.")
+            return 2
+
+        if ha_url == _SUPERVISOR_API_URL and not args.ha_url:
+            log.debug("Using HA Supervisor API at %s (auto-detected)", ha_url)
 
         hosts = discover_shelly_hosts(ha_url, ha_token, args.timeout)
         if not hosts:
-            print("No Shelly hosts discovered; nothing to do.")
+            log.error("No Shelly hosts discovered; nothing to do.")
             return 1
 
+    # Log selected file paths (never log contents)
+    log.debug("ca-file:   %s", args.ca_file or "(not set)")
+    log.debug("cert-file: %s", args.cert_file or "(not set)")
+    log.debug("key-file:  %s", args.key_file or "(not set)")
+
     # Read PEM files once
-    def read_pem(path: Optional[str]) -> Optional[str]:
+    def read_pem(path: Optional[str], label: str) -> Optional[str]:
         if path is None:
             return None
-        with open(path) as fh:
-            return fh.read()
+        try:
+            with open(path) as fh:
+                return fh.read()
+        except OSError as exc:
+            log.error("Cannot read %s file %r: %s", label, path, exc)
+            raise
 
     try:
-        ca_text = read_pem(args.ca_file)
-        cert_text = read_pem(args.cert_file)
-        key_text = read_pem(args.key_file)
-    except OSError as exc:
-        print(f"ERROR reading file: {exc}")
+        ca_text = read_pem(args.ca_file, "CA")
+        cert_text = read_pem(args.cert_file, "cert")
+        key_text = read_pem(args.key_file, "key")
+    except OSError:
         return 1
 
     results = {}
@@ -550,17 +640,18 @@ def main() -> int:
         results[host] = process_host(host, args, ca_text, cert_text, key_text)
 
     # Summary
-    print("\n=== Summary ===")
+    log.info("")
+    log.info("=== Summary ===")
     passed = sum(1 for ok in results.values() if ok)
     failed = len(results) - passed
     for host, ok in results.items():
-        status = "OK" if ok else "FAILED"
-        print(f"  {host}: {status}")
-    print(f"\n{passed} succeeded, {failed} failed.")
+        log.info("  %s: %s", host, "OK" if ok else "FAILED")
+    log.info("%d succeeded, %d failed.", passed, failed)
 
     return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
 

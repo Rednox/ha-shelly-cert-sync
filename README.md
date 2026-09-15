@@ -41,12 +41,15 @@ python sync_shelly_certs.py (--hosts <ip1>[,<ip2>,...] | --ha-url <url> --ha-tok
 | `--ca-file` | — | Path to CA PEM file |
 | `--cert-file` | — | Path to TLS client certificate PEM |
 | `--key-file` | — | Path to TLS client key PEM |
-| `--device-password` | — | Device password for HTTP Digest auth (user `admin`); applied to all hosts |
+| `--device-username` | — | Username for HTTP Digest auth (defaults to `admin` when `--device-password` is given) |
+| `--device-password` | — | Device password for HTTP Digest auth; applied to all hosts |
 | `--port` | `80` | HTTP port of Shelly device |
 | `--timeout` | `10` | Request timeout in seconds |
 | `--chunk-size` | `1024` | Base64 chunk size for uploads |
 | `--dry-run` | off | Print actions without sending mutating requests |
 | `--no-enforce-ssl-only` | off | Skip SSL-only enforcement even if TLS test passes |
+| `--debug` | off | Enable verbose DEBUG logging |
+| `--log-file` | — | Append log output to this file in addition to stdout |
 
 At least one of `--ca-file`, `--cert-file`, `--key-file` is required.
 
@@ -137,6 +140,8 @@ python sync_shelly_certs.py \
 
 When the script runs as an HA `shell_command`, the Supervisor automatically injects `SUPERVISOR_TOKEN` into the process environment and the internal API is reachable at `http://supervisor/core`. Both `--ha-url` and `--ha-token` can be omitted — the script detects them automatically.
 
+> **Note:** The `python_script` HA integration is **not** supported for this script. Use `shell_command` with the system Python (or a venv) instead.
+
 Add to `configuration.yaml`:
 
 ```yaml
@@ -146,6 +151,34 @@ shell_command:
     python /config/scripts/sync_shelly_certs.py
     --cert-file /ssl/fullchain.pem
     --key-file /ssl/privkey.pem
+```
+
+`shell_command` only surfaces the return code in HA logs. To capture detailed output for debugging, redirect to a log file:
+
+```yaml
+shell_command:
+  sync_shelly_certs: >
+    python /config/scripts/sync_shelly_certs.py
+    --cert-file /ssl/fullchain.pem
+    --key-file /ssl/privkey.pem
+    --debug
+    --log-file /config/shelly_sync.log
+```
+
+Or use a small wrapper script `/config/scripts/run_sync.sh`:
+
+```bash
+#!/bin/bash
+python /config/scripts/sync_shelly_certs.py \
+  --cert-file /ssl/fullchain.pem \
+  --key-file /ssl/privkey.pem \
+  --debug \
+  --log-file /config/shelly_sync.log >> /config/shelly_sync.log 2>&1
+```
+
+```yaml
+shell_command:
+  sync_shelly_certs: bash /config/scripts/run_sync.sh
 ```
 
 If you need to run the script externally (e.g. from cron on a different machine) you must supply the URL and token explicitly:
@@ -180,7 +213,7 @@ automation:
 ## Security notes
 
 - **Private key handling**: `--key-file` passes your private key over plain HTTP to the Shelly device during the initial upload. This is unavoidable for the first upload because the device doesn't yet have a valid certificate. Ensure the upload happens on a trusted local network segment. After a successful TLS test the device is switched to SSL-only mode, securing subsequent communication.
-- **Device password**: `--device-password` is transmitted over plain HTTP as part of the Digest auth exchange during the initial upload phase. Avoid passing it on the command line in shared environments (it would appear in process listings); use a wrapper script or HA's `secrets.yaml` instead.
+- **Device credentials**: `--device-password` (and `--device-username`) are transmitted over plain HTTP as part of the Digest auth exchange during the initial upload phase. Avoid passing credentials on the command line in shared environments (they appear in process listings); use a wrapper script or HA's `secrets.yaml` instead.
 - **Local network trust**: The script disables TLS certificate verification for the post-upload connectivity test (`ssl.CERT_NONE`). This is intentional: the machine running the script may not trust the newly uploaded CA. The test only checks that a TLS handshake succeeds; it does **not** validate the certificate chain.
 - **`--dry-run`**: Use this in CI or testing environments to confirm the correct hosts and files are targeted before making live changes.
 
