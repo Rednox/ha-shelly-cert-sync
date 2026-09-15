@@ -7,11 +7,17 @@ SSL-only mode after a successful TLS connectivity test.
 Device hosts can be supplied explicitly via --hosts or discovered
 automatically from a running Home Assistant instance via --ha-url /
 --ha-token (Shelly integration devices only).
+
+When running as a Home Assistant shell_command the HA Supervisor injects
+the SUPERVISOR_TOKEN environment variable and the internal API is reachable
+at http://supervisor/core — both --ha-url and --ha-token can be omitted in
+that case and are detected automatically.
 """
 
 import argparse
 import base64
 import json
+import os
 import re
 import ssl
 import sys
@@ -25,6 +31,10 @@ from typing import Optional
 # firmware below 1.3.0 as "too old to update automatically".
 # Gen-1 devices use a completely different REST API and are not supported.
 MIN_FW_VERSION = (1, 4, 2)
+
+# Supervisor-injected env vars available inside HA add-ons / shell_commands
+_SUPERVISOR_TOKEN_ENV = "SUPERVISOR_TOKEN"
+_SUPERVISOR_API_URL = "http://supervisor/core"
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +390,9 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Upload Let's Encrypt certs to Shelly devices via HTTP RPC. "
             "Hosts can be supplied explicitly (--hosts) or discovered "
-            "automatically from Home Assistant (--ha-url + --ha-token)."
+            "automatically from Home Assistant (--ha-url + --ha-token). "
+            "When running as an HA shell_command both flags are optional: "
+            "the Supervisor token and API URL are read from the environment."
         )
     )
 
@@ -395,13 +407,19 @@ def parse_args() -> argparse.Namespace:
         "--ha-url",
         default=None,
         metavar="URL",
-        help="Home Assistant base URL, e.g. http://homeassistant.local:8123",
+        help=(
+            "Home Assistant base URL, e.g. http://homeassistant.local:8123. "
+            "Defaults to http://supervisor/core when SUPERVISOR_TOKEN is set."
+        ),
     )
     host_group.add_argument(
         "--ha-token",
         default=None,
         metavar="TOKEN",
-        help="Home Assistant long-lived access token (used with --ha-url).",
+        help=(
+            "Home Assistant long-lived access token. "
+            "Defaults to $SUPERVISOR_TOKEN when running inside HA."
+        ),
     )
 
     parser.add_argument("--ca-file", default=None, help="Path to CA PEM file.")
@@ -431,19 +449,29 @@ def main() -> int:
         print("ERROR: use either --hosts or --ha-url, not both.")
         return 1
 
-    if args.ha_url:
-        if not args.ha_token:
+    if args.hosts:
+        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+    else:
+        # Auto-detect HA Supervisor environment when neither --ha-url nor
+        # --ha-token was passed (e.g. when invoked as an HA shell_command).
+        supervisor_token = os.environ.get(_SUPERVISOR_TOKEN_ENV, "")
+        ha_url = args.ha_url or (_SUPERVISOR_API_URL if supervisor_token else None)
+        ha_token = args.ha_token or supervisor_token or None
+
+        if not ha_url:
+            print(
+                "ERROR: provide --hosts or --ha-url to specify target device(s), "
+                f"or run inside Home Assistant where ${_SUPERVISOR_TOKEN_ENV} is set."
+            )
+            return 1
+        if not ha_token:
             print("ERROR: --ha-token is required when using --ha-url.")
             return 1
-        hosts = discover_shelly_hosts(args.ha_url, args.ha_token, args.timeout)
+
+        hosts = discover_shelly_hosts(ha_url, ha_token, args.timeout)
         if not hosts:
             print("No Shelly hosts discovered; nothing to do.")
             return 1
-    elif args.hosts:
-        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
-    else:
-        print("ERROR: provide --hosts or --ha-url to specify target device(s).")
-        return 1
 
     # Read PEM files once
     def read_pem(path: Optional[str]) -> Optional[str]:

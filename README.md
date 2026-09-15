@@ -125,13 +125,26 @@ python sync_shelly_certs.py \
 
 ### Home Assistant `shell_command` + automation
 
-Add to `configuration.yaml` (using auto-discovery so new Shelly devices are picked up automatically):
+When the script runs as an HA `shell_command`, the Supervisor automatically injects `SUPERVISOR_TOKEN` into the process environment and the internal API is reachable at `http://supervisor/core`. Both `--ha-url` and `--ha-token` can be omitted — the script detects them automatically.
+
+Add to `configuration.yaml`:
 
 ```yaml
 shell_command:
+  # No --ha-url or --ha-token needed when running inside HA
   sync_shelly_certs: >
     python /config/scripts/sync_shelly_certs.py
-    --ha-url http://localhost:8123
+    --cert-file /ssl/fullchain.pem
+    --key-file /ssl/privkey.pem
+```
+
+If you need to run the script externally (e.g. from cron on a different machine) you must supply the URL and token explicitly:
+
+```yaml
+shell_command:
+  sync_shelly_certs_external: >
+    python /config/scripts/sync_shelly_certs.py
+    --ha-url http://homeassistant.local:8123
     --ha-token YOUR_LONG_LIVED_TOKEN
     --cert-file /ssl/fullchain.pem
     --key-file /ssl/privkey.pem
