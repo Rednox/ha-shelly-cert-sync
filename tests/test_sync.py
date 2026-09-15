@@ -182,5 +182,84 @@ class TestHADiscovery(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class TestDeviceOpener(unittest.TestCase):
+    """Verify _device_opener covers both HTTP and HTTPS and that all device
+    helpers use the shared opener rather than building their own."""
+
+    def test_unauthenticated_opener_has_https_handler(self):
+        """Unauthenticated opener should still use the no-verify HTTPS handler."""
+        import urllib.request as ur
+        opener = m._device_opener("1.2.3.4", 80, None, None)
+        handler_types = [type(h).__name__ for h in opener.handlers]
+        self.assertIn("HTTPSHandler", handler_types)
+
+    def test_authenticated_opener_has_digest_and_https_handlers(self):
+        import urllib.request as ur
+        opener = m._device_opener("1.2.3.4", 80, "admin", "secret")
+        handler_types = [type(h).__name__ for h in opener.handlers]
+        self.assertIn("HTTPSHandler", handler_types)
+        self.assertIn("HTTPDigestAuthHandler", handler_types)
+
+    def test_authenticated_opener_registers_both_schemes(self):
+        """Password manager must have credentials for both http and https URIs."""
+        import urllib.request as ur
+        opener = m._device_opener("1.2.3.4", 80, "admin", "secret")
+        digest_handler = next(
+            h for h in opener.handlers if isinstance(h, ur.HTTPDigestAuthHandler)
+        )
+        mgr = digest_handler.passwd
+        http_creds = mgr.find_user_password(None, "http://1.2.3.4:80/rpc/Shelly.GetDeviceInfo")
+        https_creds = mgr.find_user_password(None, "https://1.2.3.4/rpc/Shelly.GetDeviceInfo")
+        self.assertEqual(http_creds, ("admin", "secret"))
+        self.assertEqual(https_creds, ("admin", "secret"))
+
+    def test_rpc_call_uses_passed_opener(self):
+        """_rpc_call must use the provided opener, not build its own."""
+        mock_opener = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"result": "ok"}'
+        mock_opener.open.return_value = mock_resp
+        result = m._rpc_call("1.2.3.4", 80, "GetDeviceInfo", {}, 5, mock_opener)
+        mock_opener.open.assert_called_once()
+        self.assertEqual(result, {"result": "ok"})
+
+    def test_test_tls_uses_passed_opener(self):
+        """_test_tls must use the provided opener (not build its own)."""
+        mock_opener = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.status = 200
+        mock_opener.open.return_value = mock_resp
+        ok, reason = m._test_tls("1.2.3.4", 5, mock_opener)
+        mock_opener.open.assert_called_once()
+        self.assertTrue(ok)
+
+    def test_check_firmware_uses_passed_opener(self):
+        """check_firmware must use the provided opener for all its requests."""
+        import json as _json
+        mock_opener = MagicMock()
+
+        def fake_open(req, timeout):
+            resp = MagicMock()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            if "GetDeviceInfo" in req.full_url:
+                resp.read.return_value = _json.dumps({"gen": 2, "fw_id": "1.5.0"}).encode()
+            else:
+                resp.read.return_value = _json.dumps(
+                    {"methods": ["Shelly.PutUserCA", "Shelly.PutTLSClientCert",
+                                 "Shelly.PutTLSClientKey"]}
+                ).encode()
+            return resp
+
+        mock_opener.open.side_effect = fake_open
+        ok, reason = m.check_firmware("1.2.3.4", 80, 5, mock_opener)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(mock_opener.open.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -184,8 +184,7 @@ def _parse_fw_version(ver_str: str) -> tuple[int, ...]:
 
 
 def check_firmware(host: str, port: int, timeout: int,
-                   device_username: Optional[str] = None,
-                   device_password: Optional[str] = None) -> tuple[bool, str]:
+                   opener: urllib.request.OpenerDirector) -> tuple[bool, str]:
     """
     Verify the device is Gen-2+ and capable of TLS certificate uploads.
 
@@ -194,7 +193,6 @@ def check_firmware(host: str, port: int, timeout: int,
       2. If ListMethods is unavailable, fall back to firmware version check
          (>= 1.4.2 per Allterco's AWS-IoT provisioning script).
     """
-    opener = _device_opener(host, port, device_username, device_password)
     url = f"http://{host}:{port}/rpc/Shelly.GetDeviceInfo"
     req = urllib.request.Request(url, method="GET")
     log.debug("Firmware check: GET %s", url)
@@ -248,20 +246,31 @@ def _device_opener(host: str, port: int,
                    device_username: Optional[str],
                    device_password: Optional[str]) -> urllib.request.OpenerDirector:
     """
-    Build an urllib opener for a Shelly device.
-    When credentials are set, attaches an HTTPDigestAuthHandler so that
-    401 challenges are answered automatically.
+    Build a single urllib opener for all device calls (HTTP and HTTPS).
+
+    Registers credentials for both http:// and https:// base URIs so that
+    Digest auth fires correctly for plain-HTTP RPC calls, the HTTPS TLS test,
+    and any other device endpoint — all using the same nonce state.
+
+    Certificate verification is intentionally disabled for HTTPS because we
+    just pushed a new cert and the device CA is unlikely to be trusted by the
+    calling machine.
     """
+    # No-verify SSL context used for the HTTPS TLS test
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
     if device_username and device_password:
         mgr = urllib.request.HTTPPasswordMgr()
-        mgr.add_password(
-            realm=None,
-            uri=f"http://{host}:{port}/",
-            user=device_username,
-            passwd=device_password,
+        # Register for both http and https so auth works regardless of scheme
+        for uri in (f"http://{host}:{port}/", f"https://{host}/"):
+            mgr.add_password(None, uri, device_username, device_password)
+        return urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            urllib.request.HTTPDigestAuthHandler(mgr),
         )
-        return urllib.request.build_opener(urllib.request.HTTPDigestAuthHandler(mgr))
-    return urllib.request.build_opener()
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +278,7 @@ def _device_opener(host: str, port: int,
 # ---------------------------------------------------------------------------
 
 def _rpc_call(host: str, port: int, method: str, params: dict, timeout: int,
-              device_username: Optional[str] = None,
-              device_password: Optional[str] = None) -> dict:
+              opener: urllib.request.OpenerDirector) -> dict:
     """Send a single HTTP RPC call and return the parsed JSON response."""
     url = f"http://{host}:{port}/rpc/Shelly.{method}"
     body = json.dumps(params).encode()
@@ -281,15 +289,13 @@ def _rpc_call(host: str, port: int, method: str, params: dict, timeout: int,
         method="POST",
     )
     log.debug("RPC POST %s", url)
-    opener = _device_opener(host, port, device_username, device_password)
     with opener.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
 def _upload_file(host: str, port: int, method: str, pem_text: str,
                  chunk_size: int, timeout: int, dry_run: bool,
-                 device_username: Optional[str] = None,
-                 device_password: Optional[str] = None) -> bool:
+                 opener: urllib.request.OpenerDirector) -> bool:
     """
     Upload a PEM file to a Shelly device using the given RPC method name.
     Returns True on success, False on any error.
@@ -304,7 +310,7 @@ def _upload_file(host: str, port: int, method: str, pem_text: str,
         log.info("  [dry-run] %s: clear (data=null)", method)
     else:
         try:
-            _rpc_call(host, port, method, {"data": None}, timeout, device_username, device_password)
+            _rpc_call(host, port, method, {"data": None}, timeout, opener)
         except Exception as exc:
             log.error("  %s: clear failed: %s", method, exc)
             return False
@@ -316,8 +322,7 @@ def _upload_file(host: str, port: int, method: str, pem_text: str,
             continue
         log.debug("  %s: uploading chunk %d/%d", method, idx + 1, len(chunks))
         try:
-            _rpc_call(host, port, method, {"data": chunk, "append": True}, timeout,
-                      device_username, device_password)
+            _rpc_call(host, port, method, {"data": chunk, "append": True}, timeout, opener)
         except Exception as exc:
             log.error("  %s: chunk %d/%d failed: %s", method, idx + 1, len(chunks), exc)
             return False
@@ -332,32 +337,17 @@ def _upload_file(host: str, port: int, method: str, pem_text: str,
 # ---------------------------------------------------------------------------
 
 def _test_tls(host: str, timeout: int,
-              device_username: Optional[str] = None,
-              device_password: Optional[str] = None) -> tuple[bool, str]:
+              opener: urllib.request.OpenerDirector) -> tuple[bool, str]:
     """
-    Try an HTTPS GET to the device. Returns (success, reason).
-    Certificate verification is intentionally disabled because we just pushed
-    a new cert and the device CA trust may not match the calling machine.
+    Try an HTTPS GET to the device using the shared opener (which already has
+    the no-verify SSL context and any Digest auth configured). Returns (ok, reason).
     """
     url = f"https://{host}/rpc/Shelly.GetDeviceInfo"
     log.debug("TLS test: GET %s (cert verification disabled)", url)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     try:
         req = urllib.request.Request(url, method="GET")
-        if device_username and device_password:
-            mgr = urllib.request.HTTPPasswordMgr()
-            mgr.add_password(None, f"https://{host}/", device_username, device_password)
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPSHandler(context=ctx),
-                urllib.request.HTTPDigestAuthHandler(mgr),
-            )
-            with opener.open(req, timeout=timeout) as resp:
-                status = resp.status
-        else:
-            with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-                status = resp.status
+        with opener.open(req, timeout=timeout) as resp:
+            status = resp.status
         if status == 200:
             return True, "HTTP 200"
         return False, f"HTTP {status}"
@@ -371,8 +361,7 @@ def _test_tls(host: str, timeout: int,
 # ---------------------------------------------------------------------------
 
 def _enforce_ssl_only(host: str, port: int, timeout: int, dry_run: bool,
-                      device_username: Optional[str] = None,
-                      device_password: Optional[str] = None) -> bool:
+                      opener: urllib.request.OpenerDirector) -> bool:
     """
     Enable SSL-only mode via Shelly.SetConfig (ssl_ca = "*").
     Returns True on success.
@@ -383,7 +372,7 @@ def _enforce_ssl_only(host: str, port: int, timeout: int, dry_run: bool,
         return True
     log.debug("Enforcing SSL-only on %s", host)
     try:
-        _rpc_call(host, port, "SetConfig", params, timeout, device_username, device_password)
+        _rpc_call(host, port, "SetConfig", params, timeout, opener)
         log.info("  Shelly.SetConfig: SSL-only enforced")
         return True
     except Exception as exc:
@@ -402,15 +391,18 @@ def process_host(host: str, args: argparse.Namespace,
     """Process one host; return True if every step succeeded."""
     log.info("")
     log.info("=== Host: %s ===", host)
-    uname = args.device_username
-    pwd = args.device_password
+
+    # Build one opener for this host — shared by all HTTP and HTTPS calls so
+    # Digest auth nonce state is preserved across GetDeviceInfo, ListMethods,
+    # all Put* uploads, the HTTPS TLS test, and SetConfig.
+    opener = _device_opener(host, args.port, args.device_username, args.device_password)
 
     # --- firmware / generation check ---
     if args.dry_run:
         log.info("  [dry-run] firmware check skipped")
     else:
         log.debug("Running firmware/capability check …")
-        supported, fw_reason = check_firmware(host, args.port, args.timeout, uname, pwd)
+        supported, fw_reason = check_firmware(host, args.port, args.timeout, opener)
         if not supported:
             log.warning("  SKIP: %s", fw_reason)
             return False
@@ -430,7 +422,7 @@ def process_host(host: str, args: argparse.Namespace,
     for method, pem_text in uploads:
         ok = _upload_file(
             host, args.port, method, pem_text,
-            args.chunk_size, args.timeout, args.dry_run, uname, pwd,
+            args.chunk_size, args.timeout, args.dry_run, opener,
         )
         if not ok:
             host_ok = False
@@ -440,7 +432,7 @@ def process_host(host: str, args: argparse.Namespace,
         log.info("  [dry-run] TLS test skipped")
         tls_ok = False
     else:
-        tls_ok, reason = _test_tls(host, args.timeout, uname, pwd)
+        tls_ok, reason = _test_tls(host, args.timeout, opener)
         if tls_ok:
             log.info("  TLS test: PASS (%s)", reason)
         else:
@@ -453,7 +445,7 @@ def process_host(host: str, args: argparse.Namespace,
     elif not tls_ok:
         log.info("  SSL-only: skipped (TLS test did not pass)")
     else:
-        ssl_ok = _enforce_ssl_only(host, args.port, args.timeout, args.dry_run, uname, pwd)
+        ssl_ok = _enforce_ssl_only(host, args.port, args.timeout, args.dry_run, opener)
         if not ssl_ok:
             host_ok = False
 
