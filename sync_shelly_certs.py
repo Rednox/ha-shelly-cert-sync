@@ -184,13 +184,21 @@ def _parse_fw_version(ver_str: str) -> tuple[int, ...]:
 
 
 def check_firmware(host: str, port: int, timeout: int,
-                   opener: urllib.request.OpenerDirector) -> tuple[bool, str]:
+                   opener: urllib.request.OpenerDirector
+                   ) -> tuple[bool, str, Optional[set[str]]]:
     """
     Verify the device is Gen-2+ and capable of TLS certificate uploads.
 
-    Two-step approach recommended by Allterco's own fleet management tooling:
-      1. Call Shelly.ListMethods and confirm all three Put* methods are present.
-      2. If ListMethods is unavailable, fall back to firmware version check
+    Returns (supported, reason, methods) where *methods* is the set of RPC
+    method names advertised by the device (from Shelly.ListMethods), or None
+    when ListMethods is unavailable.  Callers use *methods* to select the
+    correct upload method pair:
+      - Shelly.PutHTTPServerCert / PutHTTPServerKey  (HTTPS server cert — preferred)
+      - Shelly.PutTLSClientCert  / PutTLSClientKey   (TLS client cert — fallback)
+
+    Two-step approach:
+      1. Call Shelly.ListMethods — authoritative runtime capability check.
+      2. If unavailable, fall back to firmware version comparison
          (>= 1.4.2 per Allterco's AWS-IoT provisioning script).
     """
     auth_active = any(
@@ -204,12 +212,12 @@ def check_firmware(host: str, port: int, timeout: int,
             log.debug("  → HTTP %s", resp.status)
             info = json.loads(resp.read().decode())
     except Exception as exc:
-        return False, f"Could not reach device: {exc}"
+        return False, f"Could not reach device: {exc}", None
 
     gen = info.get("gen", 1)
     log.debug("Device gen=%s fw_id=%s", gen, info.get("fw_id") or info.get("ver"))
     if gen < 2:
-        return False, f"Gen-{gen} device – RPC TLS methods not supported"
+        return False, f"Gen-{gen} device – RPC TLS methods not supported", None
 
     # Preferred: runtime capability check via Shelly.ListMethods
     try:
@@ -219,28 +227,41 @@ def check_firmware(host: str, port: int, timeout: int,
         with opener.open(lm_req, timeout=timeout) as lm_resp:
             log.debug("  → HTTP %s", lm_resp.status)
             methods_resp = json.loads(lm_resp.read().decode())
-        methods = set(methods_resp.get("methods", []))
-        required = {"Shelly.PutUserCA", "Shelly.PutTLSClientCert", "Shelly.PutTLSClientKey"}
-        missing = required - methods
-        if missing:
-            return False, (
-                f"Device does not advertise required methods: "
-                f"{', '.join(sorted(missing))}"
-            )
+        methods: set[str] = set(methods_resp.get("methods", []))
+
+        # At minimum the device must support PutUserCA and at least one cert/key pair
+        http_server_pair = {"Shelly.PutHTTPServerCert", "Shelly.PutHTTPServerKey"}
+        tls_client_pair  = {"Shelly.PutTLSClientCert",  "Shelly.PutTLSClientKey"}
+        has_ca           = "Shelly.PutUserCA" in methods
+        has_http_server  = http_server_pair.issubset(methods)
+        has_tls_client   = tls_client_pair.issubset(methods)
+
+        if not has_ca:
+            return False, "Device does not advertise Shelly.PutUserCA", None
+        if not (has_http_server or has_tls_client):
+            msg = ("Device advertises neither PutHTTPServerCert/Key nor "
+                   "PutTLSClientCert/Key")
+            return False, msg, None
+
         fw_str = info.get("fw_id") or info.get("ver") or "unknown"
-        log.debug("ListMethods OK; required methods present")
-        return True, f"Gen-{gen}, firmware {fw_str} (ListMethods OK)"
+        pairs = []
+        if has_http_server:
+            pairs.append("PutHTTPServerCert/Key")
+        if has_tls_client:
+            pairs.append("PutTLSClientCert/Key")
+        log.debug("ListMethods OK; available cert/key methods: %s", ", ".join(pairs))
+        return True, f"Gen-{gen}, firmware {fw_str} (ListMethods OK)", methods
     except Exception as exc:
         log.debug("ListMethods unavailable (%s); falling back to version check", exc)
 
-    # Fallback: firmware version comparison
+    # Fallback: firmware version comparison — can't inspect methods
     fw_str = info.get("fw_id") or info.get("ver") or ""
     fw_tuple = _parse_fw_version(fw_str)
     if fw_tuple < MIN_FW_VERSION:
         min_str = ".".join(str(x) for x in MIN_FW_VERSION)
-        return False, f"Firmware {fw_str} is below minimum {min_str}"
+        return False, f"Firmware {fw_str} is below minimum {min_str}", None
 
-    return True, f"Gen-{gen}, firmware {fw_str}"
+    return True, f"Gen-{gen}, firmware {fw_str}", None
 
 
 # ---------------------------------------------------------------------------
@@ -412,16 +433,44 @@ def process_host(host: str, args: argparse.Namespace,
     # all Put* uploads, the HTTPS TLS test, and SetConfig.
     opener = _device_opener(host, args.port, args.device_username, args.device_password)
 
-    # --- firmware / generation check ---
-    if args.dry_run:
-        log.info("  [dry-run] firmware check skipped")
+    # --- firmware / generation check (always runs — read-only) ---
+    # Even in dry-run mode we probe the device to determine which cert/key
+    # upload method pair to use, so the logged method names are accurate.
+    device_methods: Optional[set[str]] = None   # populated when ListMethods succeeds
+    log.debug("Running firmware/capability check …%s",
+              " (dry-run — uploads will be skipped)" if args.dry_run else "")
+    supported, fw_reason, device_methods = check_firmware(
+        host, args.port, args.timeout, opener
+    )
+    if not supported:
+        log.warning("  SKIP: %s", fw_reason)
+        return False
+    log.info("  Firmware OK%s: %s",
+             " [dry-run]" if args.dry_run else "", fw_reason)
+
+    # --- select cert/key upload method pair ---
+    # Shelly.PutHTTPServerCert / PutHTTPServerKey  → enables HTTPS server (preferred)
+    # Shelly.PutTLSClientCert  / PutTLSClientKey   → client-auth cert (fallback)
+    # The HTTP server pair is only preferred when ListMethods confirmed it is
+    # present; fall back to the TLS client pair for older firmware or when
+    # ListMethods was unavailable.
+    if (device_methods is not None and
+            {"Shelly.PutHTTPServerCert", "Shelly.PutHTTPServerKey"}.issubset(device_methods)):
+        cert_method = "PutHTTPServerCert"
+        key_method  = "PutHTTPServerKey"
+        log.debug(
+            "Cert/key method: PutHTTPServerCert/Key "
+            "(advertised by device – configures HTTPS server cert)"
+        )
     else:
-        log.debug("Running firmware/capability check …")
-        supported, fw_reason = check_firmware(host, args.port, args.timeout, opener)
-        if not supported:
-            log.warning("  SKIP: %s", fw_reason)
-            return False
-        log.info("  Firmware OK: %s", fw_reason)
+        cert_method = "PutTLSClientCert"
+        key_method  = "PutTLSClientKey"
+        reason = (
+            "PutHTTPServerCert/Key not in ListMethods"
+            if device_methods is not None
+            else "ListMethods unavailable – using default"
+        )
+        log.debug("Cert/key method: PutTLSClientCert/Key (%s)", reason)
 
     host_ok = True
 
@@ -430,9 +479,9 @@ def process_host(host: str, args: argparse.Namespace,
     if ca_text is not None:
         uploads.append(("PutUserCA", ca_text))
     if cert_text is not None:
-        uploads.append(("PutTLSClientCert", cert_text))
+        uploads.append((cert_method, cert_text))
     if key_text is not None:
-        uploads.append(("PutTLSClientKey", key_text))
+        uploads.append((key_method, key_text))
 
     for method, pem_text in uploads:
         ok = _upload_file(

@@ -7,7 +7,10 @@ A minimal Python script that propagates Let's Encrypt (or any PEM) TLS certifica
 ## What the script does
 
 1. Resolves the target device list – either from `--hosts` (explicit IPs) or automatically by querying the Home Assistant device registry for all devices registered under the Shelly integration (`--ha-url` + `--ha-token`).
-2. For each device, calls `Shelly.GetDeviceInfo` and `Shelly.ListMethods` to verify it is a **Gen-2 or Gen-3** device with all three TLS certificate RPC methods available (firmware **≥ 1.4.2** is the tested minimum). Gen-1 devices and devices below the minimum firmware are skipped.
+2. For each device, calls `Shelly.GetDeviceInfo` and `Shelly.ListMethods` to verify it is a **Gen-2 or Gen-3** device with the necessary TLS certificate RPC methods. It then selects the best available upload method pair:
+   - **`Shelly.PutHTTPServerCert` / `PutHTTPServerKey`** (preferred) — configures the device's own HTTPS server certificate; required for the post-upload TLS connectivity test to succeed.
+   - **`Shelly.PutTLSClientCert` / `PutTLSClientKey`** (fallback) — used on older firmware that does not advertise the HTTP server cert methods.
+   Gen-1 devices and devices below firmware **≥ 1.4.2** are skipped.
 3. Reads one or more PEM files (CA, client cert, client key) from disk.
 4. Uploads each file to every listed Shelly device using the appropriate `Shelly.Put*` RPC method (chunked, base64-encoded).
 5. After uploading, performs a quick HTTPS connectivity test to verify the device accepted the certificate.
@@ -19,7 +22,7 @@ A minimal Python script that propagates Let's Encrypt (or any PEM) TLS certifica
 ## Prerequisites
 
 - Python 3.11 or newer (stdlib only – no extra packages needed).
-- Shelly **Gen-2 or Gen-3** device running firmware **≥ 1.4.2**. The `Shelly.PutUserCA` / `Shelly.PutTLSClientCert` / `Shelly.PutTLSClientKey` RPC methods require at least this version (per Allterco's own AWS IoT provisioning tooling). The script also does a runtime `Shelly.ListMethods` check before uploading, so devices advertising all three methods are accepted regardless of the reported version number. Gen-1 devices use a completely different REST API and are not supported.
+- Shelly **Gen-2 or Gen-3** device running firmware **≥ 1.4.2**. The script probes `Shelly.ListMethods` at runtime — devices advertising `Shelly.PutHTTPServerCert` / `PutHTTPServerKey` use those (preferred; enables HTTPS server), others fall back to `Shelly.PutTLSClientCert` / `PutTLSClientKey`. Gen-1 devices use a completely different REST API and are not supported.
 - Network access from the machine running the script to the Shelly device(s) on port 80 (or the configured `--port`).
 - For HA auto-discovery: a running Home Assistant instance with the Shelly integration configured and a [long-lived access token](https://developers.home-assistant.io/docs/auth_api/#long-lived-access-token).
 
@@ -221,8 +224,8 @@ automation:
 
 ## Known limitations
 
-- RPC method names (`Shelly.PutUserCA`, `Shelly.PutTLSClientCert`, `Shelly.PutTLSClientKey`, `Shelly.SetConfig`) are documented for Gen-2/Gen-3 firmware. Gen-1 devices use a different REST API and are **not supported**.
-- The script performs a `Shelly.ListMethods` probe before uploading — if a device reports all three methods as available, the firmware version requirement is waived. This matches the approach used by Allterco's own fleet management tooling.
+- RPC method names are documented for Gen-2/Gen-3 firmware. The script prefers `Shelly.PutHTTPServerCert` / `PutHTTPServerKey` (HTTPS server cert) when advertised by `ListMethods`, falling back to `Shelly.PutTLSClientCert` / `PutTLSClientKey` for older firmware. Gen-1 devices use a different REST API and are **not supported**.
+- The script performs a `Shelly.ListMethods` probe before uploading — if a device reports all required methods as available, the firmware version requirement is waived. This matches the approach used by Allterco's own fleet management tooling.
 - Firmware behaviour (accepted chunk size, CA format, `ssl_ca` config key) may vary between models and firmware versions. The minimum tested version is **1.4.2**. Test against a single device before deploying to many.
 - Plain HTTP is used for the initial upload. If the device is already in SSL-only mode and you need to re-upload, temporarily disable SSL-only mode via the Shelly web UI first.
 - HA auto-discovery uses `integration_entities("shelly")` and `device_attr(..., "configuration_url")` via the `/api/template` REST endpoint. Renamed entities that no longer belong to the Shelly integration domain will still be found correctly since the filter is by integration domain, not entity name.

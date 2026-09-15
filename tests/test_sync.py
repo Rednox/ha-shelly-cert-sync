@@ -138,8 +138,18 @@ class TestLoggingSetup(unittest.TestCase):
 class TestDryRunPaths(unittest.TestCase):
     """End-to-end dry-run through main() without network calls."""
 
+    # Firmware check now always runs (even in dry-run) for accurate method
+    # selection — mock it so tests don't require network access.
+    _fw_patch = staticmethod(lambda: patch.object(
+        m, "check_firmware",
+        return_value=(True, "Gen-2, firmware 1.5.0 (ListMethods OK)",
+                      {"Shelly.PutUserCA",
+                       "Shelly.PutHTTPServerCert", "Shelly.PutHTTPServerKey"})
+    ))
+
     def _main(self, *argv):
-        return m.main(list(argv))
+        with self._fw_patch():
+            return m.main(list(argv))
 
     def test_unauthenticated_dry_run(self):
         rc = self._main("--hosts", "1.2.3.4", "--ca-file", "/dev/null", "--dry-run")
@@ -159,6 +169,25 @@ class TestDryRunPaths(unittest.TestCase):
         rc = self._main("--hosts", "1.2.3.4", "--cert-file", "/dev/null",
                         "--dry-run", "--debug")
         self.assertEqual(rc, 0)
+
+    def test_dry_run_uses_http_server_method_when_advertised(self):
+        """Dry-run must log PutHTTPServerCert when device advertises it."""
+        import io
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.DEBUG)
+        root = logging.getLogger()
+        old_level = root.level
+        root.setLevel(logging.DEBUG)
+        try:
+            root.addHandler(handler)
+            self._main("--hosts", "1.2.3.4", "--cert-file", "/dev/null", "--dry-run", "--debug")
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
+        output = buf.getvalue()
+        self.assertIn("PutHTTPServerCert", output)
+        self.assertNotIn("PutTLSClientCert", output)
 
 
 class TestHADiscovery(unittest.TestCase):
@@ -246,6 +275,7 @@ class TestDeviceOpener(unittest.TestCase):
             resp = MagicMock()
             resp.__enter__ = lambda s: s
             resp.__exit__ = MagicMock(return_value=False)
+            resp.status = 200
             if "GetDeviceInfo" in req.full_url:
                 resp.read.return_value = _json.dumps({"gen": 2, "fw_id": "1.5.0"}).encode()
             else:
@@ -256,8 +286,9 @@ class TestDeviceOpener(unittest.TestCase):
             return resp
 
         mock_opener.open.side_effect = fake_open
-        ok, reason = m.check_firmware("1.2.3.4", 80, 5, mock_opener)
+        ok, reason, methods = m.check_firmware("1.2.3.4", 80, 5, mock_opener)
         self.assertTrue(ok)
+        self.assertIsNotNone(methods)
         self.assertGreaterEqual(mock_opener.open.call_count, 1)
 
     def test_uses_password_mgr_with_default_realm(self):
@@ -342,6 +373,95 @@ class TestDeviceOpener(unittest.TestCase):
         self.assertTrue(any("GetDeviceInfo" in u for u in calls), f"Missing GetDeviceInfo in {calls}")
         self.assertTrue(any("ListMethods" in u for u in calls), f"Missing ListMethods in {calls}")
         self.assertTrue(any("PutUserCA" in u for u in calls), f"Missing PutUserCA in {calls}")
+
+
+class TestMethodSelection(unittest.TestCase):
+    """Verify process_host picks PutHTTPServerCert/Key when available,
+    falls back to PutTLSClientCert/Key otherwise."""
+
+    def _run_with_methods(self, device_methods, argv_extra=None):
+        """Run process_host with a mocked check_firmware returning device_methods.
+        Returns the list of RPC method names that were passed to _upload_file."""
+        import json as _json
+        upload_calls = []
+
+        def fake_upload(host, port, method, pem_text, chunk_size, timeout, dry_run, opener):
+            upload_calls.append(method)
+            return True
+
+        def fake_check_firmware(host, port, timeout, opener):
+            return True, "Gen-2, firmware 1.5.0 (ListMethods OK)", device_methods
+
+        with patch.object(m, "check_firmware", side_effect=fake_check_firmware):
+            with patch.object(m, "_upload_file", side_effect=fake_upload):
+                with patch.object(m, "_test_tls", return_value=(False, "skipped")):
+                    argv = [
+                        "--hosts", "1.2.3.4",
+                        "--cert-file", "/dev/null",
+                        "--key-file", "/dev/null",
+                        "--no-enforce-ssl-only",
+                    ]
+                    if argv_extra:
+                        argv += argv_extra
+                    m.main(argv)
+        return upload_calls
+
+    def test_prefers_http_server_methods_when_advertised(self):
+        """When device advertises PutHTTPServerCert/Key, those must be used."""
+        methods = {
+            "Shelly.PutUserCA",
+            "Shelly.PutHTTPServerCert", "Shelly.PutHTTPServerKey",
+            "Shelly.PutTLSClientCert",  "Shelly.PutTLSClientKey",
+        }
+        calls = self._run_with_methods(methods)
+        self.assertIn("PutHTTPServerCert", calls)
+        self.assertIn("PutHTTPServerKey",  calls)
+        self.assertNotIn("PutTLSClientCert", calls)
+        self.assertNotIn("PutTLSClientKey",  calls)
+
+    def test_falls_back_to_tls_client_methods_when_http_server_absent(self):
+        """When device only advertises PutTLSClientCert/Key (no HTTP server pair)."""
+        methods = {
+            "Shelly.PutUserCA",
+            "Shelly.PutTLSClientCert", "Shelly.PutTLSClientKey",
+        }
+        calls = self._run_with_methods(methods)
+        self.assertIn("PutTLSClientCert", calls)
+        self.assertIn("PutTLSClientKey",  calls)
+        self.assertNotIn("PutHTTPServerCert", calls)
+
+    def test_falls_back_to_tls_client_methods_when_list_methods_unavailable(self):
+        """When device_methods is None (ListMethods unavailable), use fallback pair."""
+        calls = self._run_with_methods(None)
+        self.assertIn("PutTLSClientCert", calls)
+        self.assertIn("PutTLSClientKey",  calls)
+        self.assertNotIn("PutHTTPServerCert", calls)
+
+    def test_check_firmware_returns_methods_set_on_success(self):
+        """check_firmware must return the methods set as third element."""
+        import json as _json
+        mock_opener = MagicMock()
+        http_server_methods = [
+            "Shelly.PutUserCA",
+            "Shelly.PutHTTPServerCert", "Shelly.PutHTTPServerKey",
+        ]
+
+        def fake_open(req, timeout):
+            resp = MagicMock()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            resp.status = 200
+            if "GetDeviceInfo" in req.full_url:
+                resp.read.return_value = _json.dumps({"gen": 2, "fw_id": "1.5.0"}).encode()
+            else:
+                resp.read.return_value = _json.dumps({"methods": http_server_methods}).encode()
+            return resp
+
+        mock_opener.open.side_effect = fake_open
+        ok, reason, methods = m.check_firmware("1.2.3.4", 80, 5, mock_opener)
+        self.assertTrue(ok)
+        self.assertIn("Shelly.PutHTTPServerCert", methods)
+        self.assertIn("Shelly.PutHTTPServerKey",  methods)
 
 
 if __name__ == "__main__":
